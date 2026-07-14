@@ -30,37 +30,33 @@ export class PollerDO {
   }
 
   // Wipes local rows + per-asset watermarks whenever the ASSETS list or
-  // TF changes, so old/removed assets never linger in the output file
-  // and the next cycle does a clean full backfill under the new config.
+  // TF changes (including the very first cycle after this check was
+  // added, since pre-existing storage may already hold dirty/mixed
+  // rows from before this feature existed) — so old/removed assets
+  // never linger in the output file and the next cycle does a clean
+  // full backfill under the current config.
   async resetIfConfigChanged(assets, tf) {
     const sortedAssets = [...assets].sort();
     const currentKey = `${tf}|${sortedAssets.join(',')}`;
     const prevKey = await this.state.storage.get('trackedConfigKey');
-    const prevAssets = (await this.state.storage.get('trackedAssets')) || [];
 
-    if (prevKey === undefined) {
-      // First run ever — nothing to reset, just record the fingerprint.
-      await this.state.storage.put('trackedConfigKey', currentKey);
-      await this.state.storage.put('trackedAssets', sortedAssets);
-      return;
-    }
+    if (prevKey === currentKey) return; // config unchanged, nothing to do
 
-    if (prevKey !== currentKey) {
-      console.log(
-        `ASSETS/TF changed (was "${prevKey}", now "${currentKey}") — resetting local state for a clean rebuild.`
-      );
-      await this.state.storage.delete('rows');
-      const oldTsKeys = prevAssets.map((a) => `ts-${a}`);
-      if (oldTsKeys.length) await this.state.storage.delete(oldTsKeys);
-      // Also drop watermarks for the new assets in case any survived
-      // under the same name from a prior config, to force a fresh
-      // full-history fetch for everyone under the new config.
-      const newTsKeys = sortedAssets.map((a) => `ts-${a}`);
-      if (newTsKeys.length) await this.state.storage.delete(newTsKeys);
+    console.log(
+      `Config fingerprint changed or unset (was "${prevKey}", now "${currentKey}") — resetting local state for a clean rebuild.`
+    );
 
-      await this.state.storage.put('trackedConfigKey', currentKey);
-      await this.state.storage.put('trackedAssets', sortedAssets);
-    }
+    await this.state.storage.delete('rows');
+    await this.state.storage.delete('sha');
+
+    // Enumerate every ts-* watermark currently in storage (not just ones
+    // we happen to remember) so nothing from an old/unknown config lingers.
+    const tsEntries = await this.state.storage.list({ prefix: 'ts-' });
+    const tsKeys = [...tsEntries.keys()];
+    if (tsKeys.length) await this.state.storage.delete(tsKeys);
+
+    await this.state.storage.put('trackedConfigKey', currentKey);
+    await this.state.storage.put('trackedAssets', sortedAssets);
   }
 
   async updateAll(assets, tf) {
