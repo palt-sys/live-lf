@@ -14,7 +14,7 @@
     { "tag": "v1", "new_sqlite_classes": ["PollerDO"] }
   ],
   "vars": {
-    "ASSETS": "dxy,chf,eur,gpb,btc,eth,xrp,sol,xau,xag,aud,jpy,spx,nq,ym",
+    "ASSETS": "dxy,chf,eur,gbp,btc,eth,xrp,sol,xau,xag,aud,jpy,spx,nq,ym",
     "TF": "1",
     "CANDLES": "10000",
     "INTERVAL_MS": "10000",

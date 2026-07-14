@@ -12,6 +12,7 @@ export class PollerDO {
     const tf = this.env.TF || '1';
 
     try {
+      await this.resetIfConfigChanged(assets, tf);
       await this.updateAll(assets, tf);
       await this.state.storage.put('lastError', null);
     } catch (err) {
@@ -25,6 +26,40 @@ export class PollerDO {
     if (running !== false) {
       const interval = Number(this.env.INTERVAL_MS || 10000);
       await this.state.storage.setAlarm(Date.now() + interval);
+    }
+  }
+
+  // Wipes local rows + per-asset watermarks whenever the ASSETS list or
+  // TF changes, so old/removed assets never linger in the output file
+  // and the next cycle does a clean full backfill under the new config.
+  async resetIfConfigChanged(assets, tf) {
+    const sortedAssets = [...assets].sort();
+    const currentKey = `${tf}|${sortedAssets.join(',')}`;
+    const prevKey = await this.state.storage.get('trackedConfigKey');
+    const prevAssets = (await this.state.storage.get('trackedAssets')) || [];
+
+    if (prevKey === undefined) {
+      // First run ever — nothing to reset, just record the fingerprint.
+      await this.state.storage.put('trackedConfigKey', currentKey);
+      await this.state.storage.put('trackedAssets', sortedAssets);
+      return;
+    }
+
+    if (prevKey !== currentKey) {
+      console.log(
+        `ASSETS/TF changed (was "${prevKey}", now "${currentKey}") — resetting local state for a clean rebuild.`
+      );
+      await this.state.storage.delete('rows');
+      const oldTsKeys = prevAssets.map((a) => `ts-${a}`);
+      if (oldTsKeys.length) await this.state.storage.delete(oldTsKeys);
+      // Also drop watermarks for the new assets in case any survived
+      // under the same name from a prior config, to force a fresh
+      // full-history fetch for everyone under the new config.
+      const newTsKeys = sortedAssets.map((a) => `ts-${a}`);
+      if (newTsKeys.length) await this.state.storage.delete(newTsKeys);
+
+      await this.state.storage.put('trackedConfigKey', currentKey);
+      await this.state.storage.put('trackedAssets', sortedAssets);
     }
   }
 
