@@ -7,14 +7,14 @@
   "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
-      { "name": "OHLCV_DO", "class_name": "OhlcvUpdater" }
+      { "name": "OHLCV_DO", "class_name": "PollerDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["OhlcvUpdater"] }
+    { "tag": "v1", "new_sqlite_classes": ["PollerDO"] }
   ],
   "vars": {
-    "ASSETS": "btcusd,eurusd",
+    "ASSETS": "BTCUSD,EURUSD",
     "TF": "1",
     "CANDLES": "5000",
     "INTERVAL_MS": "10000",

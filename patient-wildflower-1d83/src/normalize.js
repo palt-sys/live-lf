@@ -1,17 +1,14 @@
 // normalize.js
-
 // Canonical alias mapping (mirrors app.py's _LF_ALIAS_MAP)
 const LF_ALIAS_MAP = {
     DXY: "USDX",
     USDX: "USDX",
-
     XAU: "XAUUSD",
     GOLD: "XAUUSD",
     XAUUSD: "XAUUSD",
     XAG: "XAGUSD",
     SILVER: "XAGUSD",
     XAGUSD: "XAGUSD",
-
     EUR: "EURUSD",
     EURUSD: "EURUSD",
     GBP: "GBPUSD",
@@ -22,12 +19,10 @@ const LF_ALIAS_MAP = {
     NZDUSD: "NZDUSD",
     CAD: "USDCAD",
     USD: "USD",
-
     JPY: "USDJPY",
     USDJPY: "USDJPY",
     CHF: "USDCHF",
     USDCHF: "USDCHF",
-
     BTC: "BTCUSD",
     BTCUSD: "BTCUSD",
     BTCUSD_cl: "BTCUSD_cl",
@@ -41,12 +36,10 @@ const LF_ALIAS_MAP = {
     XRPUSD: "XRPUSD",
     XRPUSD_cl: "XRPUSD_cl",
     TOTAL: "TOTAL",
-
     SPX: "SPX",
     NQ: "NQ",
     YM: "YM",
 };
-
 const ALIAS_VALUES = new Set(Object.values(LF_ALIAS_MAP));
 const BASE_PAIRS = new Set(["EUR", "GBP", "AUD", "NZD"]);
 
@@ -56,22 +49,17 @@ const BASE_PAIRS = new Set(["EUR", "GBP", "AUD", "NZD"]);
  */
 export function normalizeLfAsset(asset) {
     if (!asset) return "";
-
     const s = asset.trim().toUpperCase().replace(/\s+/g, "").replace(/\//g, "");
-
     if (s.endsWith("USD") || s === "USDX" || s === "TOTAL" || ALIAS_VALUES.has(s)) {
         return s;
     }
-
     if (s in LF_ALIAS_MAP) {
         return LF_ALIAS_MAP[s];
     }
-
     if (s.length === 3 && /^[A-Z]+$/.test(s)) {
         if (BASE_PAIRS.has(s)) return `${s}USD`;
         return `${s}USD`;
     }
-
     return s;
 }
 
