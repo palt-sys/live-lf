@@ -19,8 +19,8 @@
     "CANDLES": "5000",
     "INTERVAL_MS": "10000",
     "GITHUB_OWNER": "palt-sys",
-    "GITHUB_REPO": "storage",
-    "GITHUB_PATH_PREFIX": "ohlcvcsv/live",
+    "GITHUB_REPO": "live-lf",
+    "GITHUB_PATH_PREFIX": "storage/livejson",
     "GITHUB_BRANCH": "main"
   }
 }
