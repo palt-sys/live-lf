@@ -29,12 +29,12 @@ export class PollerDO {
     }
   }
 
-  // Wipes local rows + per-asset watermarks whenever the ASSETS list or
-  // TF changes (including the very first cycle after this check was
-  // added, since pre-existing storage may already hold dirty/mixed
-  // rows from before this feature existed) — so old/removed assets
-  // never linger in the output file and the next cycle does a clean
-  // full backfill under the current config.
+  // Wipes local rows + per-asset watermarks AND deletes the remote
+  // GitHub file whenever the ASSETS list or TF changes (including the
+  // very first cycle after this check was added, since pre-existing
+  // storage may already hold dirty/mixed rows from before this feature
+  // existed) — so old/removed assets never linger anywhere and the
+  // next cycle does a truly clean full backfill under the current config.
   async resetIfConfigChanged(assets, tf) {
     const sortedAssets = [...assets].sort();
     const currentKey = `${tf}|${sortedAssets.join(',')}`;
@@ -43,20 +43,79 @@ export class PollerDO {
     if (prevKey === currentKey) return; // config unchanged, nothing to do
 
     console.log(
-      `Config fingerprint changed or unset (was "${prevKey}", now "${currentKey}") — resetting local state for a clean rebuild.`
+      `Config fingerprint changed or unset (was "${prevKey}", now "${currentKey}") — deleting remote file and resetting local state.`
     );
 
+    // 1. Delete the actual file on GitHub FIRST. If this fails, we throw
+    //    and leave local state untouched, so the whole reset retries
+    //    cleanly on the next alarm cycle instead of half-completing.
+    const path = `${this.env.GITHUB_PATH_PREFIX || 'storage/ohlcvcsv/live'}/${filenameFor()}`;
+    await this.deleteGithubFile(path);
+
+    // 2. Only after a successful (or not-needed) remote delete do we
+    //    clear local durable-object state.
     await this.state.storage.delete('rows');
     await this.state.storage.delete('sha');
 
-    // Enumerate every ts-* watermark currently in storage (not just ones
-    // we happen to remember) so nothing from an old/unknown config lingers.
     const tsEntries = await this.state.storage.list({ prefix: 'ts-' });
     const tsKeys = [...tsEntries.keys()];
     if (tsKeys.length) await this.state.storage.delete(tsKeys);
 
+    // 3. Record the new fingerprint last, so a crash mid-reset is
+    //    always safely retryable.
     await this.state.storage.put('trackedConfigKey', currentKey);
     await this.state.storage.put('trackedAssets', sortedAssets);
+  }
+
+  // Deletes a file from the GitHub repo outright (not an update-in-place).
+  // No-ops cleanly if the file doesn't exist yet.
+  async deleteGithubFile(path) {
+    const owner = this.env.GITHUB_OWNER;
+    const repo = this.env.GITHUB_REPO;
+    const branch = this.env.GITHUB_BRANCH || 'main';
+    const token = this.env.GITHUB_TOKEN;
+
+    if (!owner || !repo || !token) {
+      throw new Error(
+        `GitHub config missing (owner=${!!owner}, repo=${!!repo}, token=${!!token})`
+      );
+    }
+
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+    const headers = {
+      Authorization: `token ${token}`,
+      Accept: 'application/vnd.github.v3+json',
+      'User-Agent': 'cf-worker',
+    };
+    const timeoutMs = 10000;
+
+    const getResp = await fetchWithTimeout(`${apiUrl}?ref=${branch}`, { headers }, timeoutMs);
+    if (getResp.status === 404) {
+      console.log(`No existing file at ${path} to delete — nothing to do.`);
+      return;
+    }
+    if (!getResp.ok) {
+      throw new Error(`GitHub GET (pre-delete) failed: ${getResp.status} ${await safeText(getResp)}`);
+    }
+    const sha = (await getResp.json()).sha;
+
+    const delResp = await fetchWithTimeout(
+      apiUrl,
+      {
+        method: 'DELETE',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: `Reset ${path} — config changed — ${new Date().toISOString()}`,
+          sha,
+          branch,
+        }),
+      },
+      timeoutMs
+    );
+    if (!delResp.ok) {
+      throw new Error(`GitHub DELETE failed: ${delResp.status} ${await safeText(delResp)}`);
+    }
+    console.log(`Deleted remote file ${path} (old sha=${sha}) — starting fresh.`);
   }
 
   async updateAll(assets, tf) {
