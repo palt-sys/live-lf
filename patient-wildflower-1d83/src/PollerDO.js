@@ -1,4 +1,4 @@
-import { normalizeLfAsset, cacheKeyFor } from './normalize.js';
+import { normalizeLfAsset } from './normalize.js';
 
 export class PollerDO {
   constructor(state, env) {
@@ -29,7 +29,7 @@ export class PollerDO {
   }
 
   async updateAll(assets, tf) {
-    const maxCandles = Number(this.env.CANDLES || 5000);
+    const maxCandles = Number(this.env.CANDLES || 10000);
     const nowSec = Math.floor(Date.now() / 1000);
 
     const results = await Promise.all(
@@ -47,6 +47,9 @@ export class PollerDO {
 
     for (const { asset, data, lastTs } of results) {
       const { t = [], o = [], h = [], l = [], c = [], v = [] } = data;
+      console.log(
+        `asset=${asset} lastTs=${lastTs} candlesReceived=${t.length} newest=${t[t.length - 1]}`
+      );
       let maxTs = lastTs;
       for (let i = 0; i < t.length; i++) {
         if (t[i] <= lastTs) continue;
@@ -59,7 +62,9 @@ export class PollerDO {
       await this.state.storage.put(`ts-${asset}`, maxTs);
     }
 
-    if (!anyNew) return;
+    if (!anyNew) {
+      console.log('No new candles this cycle — pushing anyway (always-push mode).');
+    }
 
     const allTs = Object.keys(rowMap).map(Number).sort((a, b) => a - b);
     if (allTs.length > maxCandles) {
@@ -68,12 +73,39 @@ export class PollerDO {
     await this.state.storage.put('rows', rowMap);
 
     const json = buildJson(rowMap);
-    const filename = filenameFor(tf, assets);
+    const filename = filenameFor();
     const path = `${this.env.GITHUB_PATH_PREFIX || 'storage/ohlcvcsv/live'}/${filename}`;
+    console.log(`Writing to path: ${path}`);
 
     let sha = await this.state.storage.get('sha');
-    sha = await this.upsertFile(path, json, sha);
+    sha = await this.upsertFileWithRetry(path, json, sha);
     await this.state.storage.put('sha', sha);
+    console.log(`GitHub push succeeded, new sha=${sha}`);
+  }
+
+  // Wraps upsertFile with a small bounded retry/backoff for transient
+  // failures (network blips, GitHub secondary rate limits, etc).
+  // Does NOT retry on clear permanent failures like 401/403 auth errors.
+  async upsertFileWithRetry(path, content, currentSha, maxAttempts = 3) {
+    let lastErr;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.upsertFile(path, content, currentSha);
+      } catch (err) {
+        lastErr = err;
+        const msg = err.message || '';
+        const isAuthError = /GitHub (GET|PUT) failed: 401|GitHub (GET|PUT) failed: 403/.test(msg);
+        if (isAuthError || attempt === maxAttempts) {
+          throw err;
+        }
+        const backoffMs = 500 * 2 ** (attempt - 1); // 500ms, 1000ms, ...
+        console.error(
+          `upsertFile attempt ${attempt} failed: ${msg} — retrying in ${backoffMs}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
+    }
+    throw lastErr;
   }
 
   async upsertFile(path, content, currentSha) {
@@ -81,17 +113,28 @@ export class PollerDO {
     const repo = this.env.GITHUB_REPO;
     const branch = this.env.GITHUB_BRANCH || 'main';
     const token = this.env.GITHUB_TOKEN;
+
+    if (!owner || !repo || !token) {
+      throw new Error(
+        `GitHub config missing (owner=${!!owner}, repo=${!!repo}, token=${!!token})`
+      );
+    }
+
     const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
     const headers = {
       Authorization: `token ${token}`,
       Accept: 'application/vnd.github.v3+json',
       'User-Agent': 'cf-worker',
     };
+    const timeoutMs = 10000;
 
     if (!currentSha) {
-      const getResp = await fetch(`${apiUrl}?ref=${branch}`, { headers });
-      if (getResp.ok) currentSha = (await getResp.json()).sha;
-      else if (getResp.status !== 404) throw new Error(`GitHub GET failed: ${getResp.status}`);
+      const getResp = await fetchWithTimeout(`${apiUrl}?ref=${branch}`, { headers }, timeoutMs);
+      if (getResp.ok) {
+        currentSha = (await getResp.json()).sha;
+      } else if (getResp.status !== 404) {
+        throw new Error(`GitHub GET failed: ${getResp.status} ${await safeText(getResp)}`);
+      }
     }
 
     const body = {
@@ -101,24 +144,47 @@ export class PollerDO {
     };
     if (currentSha) body.sha = currentSha;
 
-    let putResp = await fetch(apiUrl, {
-      method: 'PUT',
-      headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
-    if (putResp.status === 409) {
-      const getResp = await fetch(`${apiUrl}?ref=${branch}`, { headers });
-      body.sha = getResp.ok ? (await getResp.json()).sha : undefined;
-      putResp = await fetch(apiUrl, {
+    let putResp = await fetchWithTimeout(
+      apiUrl,
+      {
         method: 'PUT',
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      });
+      },
+      timeoutMs
+    );
+
+    if (putResp.status === 409) {
+      console.error('GitHub PUT got 409 (stale sha) — refetching sha and retrying once.');
+      const getResp = await fetchWithTimeout(`${apiUrl}?ref=${branch}`, { headers }, timeoutMs);
+      if (!getResp.ok) {
+        throw new Error(
+          `GitHub GET (409 recovery) failed: ${getResp.status} ${await safeText(getResp)}`
+        );
+      }
+      body.sha = (await getResp.json()).sha;
+      putResp = await fetchWithTimeout(
+        apiUrl,
+        {
+          method: 'PUT',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        timeoutMs
+      );
     }
 
-    if (!putResp.ok) throw new Error(`GitHub PUT failed: ${putResp.status} ${await putResp.text()}`);
-    return (await putResp.json()).content.sha;
+    if (!putResp.ok) {
+      throw new Error(`GitHub PUT failed: ${putResp.status} ${await safeText(putResp)}`);
+    }
+
+    const putJson = await putResp.json();
+    if (!putJson?.content?.sha) {
+      throw new Error(
+        `GitHub PUT succeeded but response missing content.sha: ${JSON.stringify(putJson)}`
+      );
+    }
+    return putJson.content.sha;
   }
 
   async fetch(request) {
@@ -147,6 +213,33 @@ export class PollerDO {
   }
 }
 
+// Reads response text without throwing if the body can't be read for
+// some reason — used purely for building useful error messages.
+async function safeText(resp) {
+  try {
+    return await resp.text();
+  } catch {
+    return '<no body>';
+  }
+}
+
+// fetch() with a hard timeout so a hung GitHub API call can't stall
+// the alarm handler indefinitely.
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function buildJson(rowMap) {
   const sortedTs = Object.keys(rowMap).map(Number).sort((a, b) => a - b);
   const rows = sortedTs.map((ts) => ({
@@ -156,16 +249,21 @@ function buildJson(rowMap) {
   return JSON.stringify(rows);
 }
 
-// Filename derived from your shared helper, so it matches keys used elsewhere
-function filenameFor(tf, assets) {
-  const key = cacheKeyFor(tf, assets); // e.g. "f:1:BTCUSD,EURUSD"
-  const safe = key.replace(/:/g, '_').replace(/,/g, '-');
-  return `all_live_${safe}.json`;
+// Fixed filename — always the same file, always overwritten in place.
+function filenameFor() {
+  return `all_alive.json`;
 }
 
 async function fetchCandles(asset, tf, from, to) {
   const apiUrl = `https://my.litefinance.org/chart/get-history?symbol=${asset}&resolution=${tf}&from=${from}&to=${to}`;
-  const resp = await fetch(apiUrl, { headers: { Accept: 'application/json' } });
+  const resp = await fetchWithTimeout(apiUrl, { headers: { Accept: 'application/json' } }, 10000);
   if (!resp.ok) throw new Error(`API status ${resp.status} for ${asset}`);
-  return resp.json();
+  const body = await resp.json();
+  if (body.status === 'error') {
+    throw new Error(`LiteFinance error for ${asset}: ${body.code}`);
+  }
+  if (!body.data) {
+    throw new Error(`LiteFinance response missing data for ${asset}: ${JSON.stringify(body)}`);
+  }
+  return body.data; // { o, h, l, c, v, t } — actual candle arrays live here
 }
